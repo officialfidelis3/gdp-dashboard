@@ -1,151 +1,176 @@
 import streamlit as st
+import requests
 import pandas as pd
-import math
-from pathlib import Path
+import folium
+import sqlite3
+import time
+import smtplib
+from twilio.rest import Client
+from streamlit_folium import folium_static
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
-)
+# OpenSky API URL
+API_URL = "https://opensky-network.org/api/states/all"
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
+# Nigeria's approximate latitude and longitude boundaries
+NIGERIA_BOUNDS = {
+    "min_lat": 4.0,
+    "max_lat": 14.0,
+    "min_lon": 2.7,
+    "max_lon": 14.6
+}
 
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
+# Initialize SQLite database
+conn = sqlite3.connect("flights.db", check_same_thread=False)
+cursor = conn.cursor()
 
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
-
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
-
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
-
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
+# Create flight tracking table if not exists
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS flights (
+        icao24 TEXT PRIMARY KEY,
+        callsign TEXT,
+        latitude REAL,
+        longitude REAL,
+        altitude REAL,
+        velocity REAL,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
     )
+""")
+conn.commit()
 
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
+# Twilio SMS Configuration (replace with your credentials)
+TWILIO_SID = "your_twilio_sid"
+TWILIO_AUTH_TOKEN = "your_twilio_auth_token"
+TWILIO_PHONE_NUMBER = "your_twilio_phone"
+ALERT_PHONE_NUMBER = "your_phone_number"
 
-    return gdp_df
+# Email Configuration
+EMAIL_ADDRESS = "your_email@gmail.com"
+EMAIL_PASSWORD = "your_email_password"
+ALERT_EMAIL = "recipient_email@gmail.com"
 
-gdp_df = get_gdp_data()
-
-# -----------------------------------------------------------------------------
-# Draw the actual page
-
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
-
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
-
-# Add some spacing
-''
-''
-
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
-
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
-
-countries = gdp_df['Country Code'].unique()
-
-if not len(countries):
-    st.warning("Select at least one country")
-
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
-
-''
-''
-''
-
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
-
-st.header('GDP over time', divider='gray')
-
-''
-
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
-)
-
-''
-''
-
-
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
-
-st.header(f'GDP in {to_year}', divider='gray')
-
-''
-
-cols = st.columns(4)
-
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
-
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
-        else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
-
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
+def send_sms_alert(flight):
+    """Send SMS alert using Twilio when a specific flight is detected"""
+    try:
+        client = Client(TWILIO_SID, TWILIO_AUTH_TOKEN)
+        message = client.messages.create(
+            body=f"ALERT! Flight {flight['callsign']} (ICAO24: {flight['icao24']}) detected over Nigeria at {flight['altitude']}m altitude.",
+            from_=TWILIO_PHONE_NUMBER,
+            to=ALERT_PHONE_NUMBER
         )
+        print("SMS Alert Sent!")
+    except Exception as e:
+        print("SMS Error:", e)
+
+def send_email_alert(flight):
+    """Send Email alert when a specific flight is detected"""
+    try:
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            server.starttls()
+            server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+            subject = f"Flight Alert: {flight['callsign']} Detected"
+            body = f"Flight {flight['callsign']} (ICAO24: {flight['icao24']}) detected over Nigeria at altitude {flight['altitude']}m."
+            message = f"Subject: {subject}\n\n{body}"
+            server.sendmail(EMAIL_ADDRESS, ALERT_EMAIL, message)
+            print("Email Alert Sent!")
+    except Exception as e:
+        print("Email Error:", e)
+
+def fetch_flight_data():
+    """Fetch live flight data from OpenSky Network API"""
+    response = requests.get(API_URL)
+    if response.status_code == 200:
+        data = response.json()
+        return data.get("states", [])
+    else:
+        st.error("Failed to fetch flight data. Try again later.")
+        return []
+
+def filter_nigerian_flights(flights):
+    """Filter flights currently over Nigeria"""
+    nigerian_flights = []
+    for flight in flights:
+        if flight[5] and flight[6]:  # Ensure latitude & longitude exist
+            lat, lon = flight[6], flight[5]
+            if (NIGERIA_BOUNDS["min_lat"] <= lat <= NIGERIA_BOUNDS["max_lat"] and
+                NIGERIA_BOUNDS["min_lon"] <= lon <= NIGERIA_BOUNDS["max_lon"]):
+                flight_data = {
+                    "icao24": flight[0],
+                    "callsign": flight[1].strip() if flight[1] else "Unknown",
+                    "latitude": lat,
+                    "longitude": lon,
+                    "altitude": flight[7],
+                    "velocity": flight[9]
+                }
+                nigerian_flights.append(flight_data)
+                
+                # Send alert if the flight matches the watchlist
+                if flight_data["callsign"] in watchlist:
+                    send_sms_alert(flight_data)
+                    send_email_alert(flight_data)
+
+    return nigerian_flights
+
+def save_to_db(flights):
+    """Save flight data to SQLite database"""
+    for flight in flights:
+        cursor.execute("""
+            INSERT OR REPLACE INTO flights (icao24, callsign, latitude, longitude, altitude, velocity)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (flight["icao24"], flight["callsign"], flight["latitude"], flight["longitude"], flight["altitude"], flight["velocity"]))
+    conn.commit()
+
+def load_past_flights():
+    """Load historical flight data"""
+    cursor.execute("SELECT * FROM flights ORDER BY timestamp DESC LIMIT 50")
+    return cursor.fetchall()
+
+# Streamlit App
+st.title("✈️ Nigeria Flight Tracker")
+st.write("Live flight tracking over Nigeria using OpenSky Network API.")
+
+# User input for tracking specific flights
+watchlist = st.text_input("Enter flight callsign(s) to watch (comma-separated)", "").upper().split(",")
+
+# Fetch and display flight data
+flights = fetch_flight_data()
+nigerian_flights = filter_nigerian_flights(flights)
+
+if nigerian_flights:
+    save_to_db(nigerian_flights)
+
+    # **Search Functionality**
+    search_query = st.text_input("🔍 Search by ICAO24 or Callsign").upper()
+    if search_query:
+        nigerian_flights = [f for f in nigerian_flights if search_query in f["callsign"] or search_query in f["icao24"]]
+
+    # Display flight table
+    st.subheader("🛫 Active Flights Over Nigeria")
+    df = pd.DataFrame(nigerian_flights)
+    st.dataframe(df)
+
+    # Display map
+    m = folium.Map(location=[9.08, 8.68], zoom_start=6)
+    for flight in nigerian_flights:
+        folium.Marker(
+            location=[flight["latitude"], flight["longitude"]],
+            popup=f'Callsign: {flight["callsign"]}\nAltitude: {flight["altitude"]}m',
+            icon=folium.Icon(color="blue", icon="plane", prefix="fa")
+        ).add_to(m)
+    folium_static(m)
+
+else:
+    st.warning("No active flights detected over Nigeria at the moment.")
+
+# **Flight History Tracking**
+st.subheader("📜 Flight History (Last 50 Records)")
+past_flights = load_past_flights()
+if past_flights:
+    df_history = pd.DataFrame(past_flights, columns=["ICAO24", "Callsign", "Latitude", "Longitude", "Altitude", "Velocity", "Timestamp"])
+    st.dataframe(df_history)
+else:
+    st.write("No past flight records found.")
+
+# Refresh every 60 seconds
+time.sleep(60)
+st.rerun()
+
